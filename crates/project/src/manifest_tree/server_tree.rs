@@ -13,10 +13,11 @@ use std::{
 };
 
 use collections::IndexMap;
-use gpui::{App, Entity};
+use fs::Fs;
+use gpui::{App, AsyncApp, Entity};
 use language::{
     CachedLspAdapter, LanguageName, LanguageRegistry, LocalLanguageToolchainStore,
-    ManifestDelegate, ManifestName, Toolchain, language_settings::AllLanguageSettings,
+    LspAdapterDelegate, ManifestDelegate, ManifestName, language_settings::AllLanguageSettings,
 };
 use lsp::LanguageServerName;
 use settings::{Settings, SettingsLocation, WorktreeId};
@@ -38,6 +39,7 @@ pub struct LanguageServerTree {
     manifest_tree: Entity<ManifestTree>,
     pub(crate) instances: BTreeMap<WorktreeId, ServersForWorktree>,
     languages: Arc<LanguageRegistry>,
+    fs: Arc<dyn Fs>,
 }
 
 /// A node in language server tree represents either:
@@ -53,7 +55,7 @@ pub(crate) struct LaunchDisposition {
     /// Path to the root directory of a subproject.
     pub(crate) path: ProjectPath,
     pub(crate) settings: Arc<LspSettings>,
-    pub(crate) toolchain: Option<Toolchain>,
+    pub(crate) workspace_configuration: Arc<OnceLock<serde_json::Value>>,
 }
 
 impl LanguageServerTreeNode {
@@ -95,18 +97,35 @@ pub struct InnerTreeNode {
 
 impl InnerTreeNode {
     fn new(
-        server_name: LanguageServerName,
+        adapter: Arc<CachedLspAdapter>,
         path: ProjectPath,
         settings: LspSettings,
-        toolchain: Option<Toolchain>,
+        fs: Arc<dyn Fs>,
+        toolchains: Arc<dyn LocalLanguageToolchainStore>,
+        lsp_delegate: Arc<dyn LspAdapterDelegate>,
+        cx: &mut AsyncApp,
     ) -> Self {
+        let workspace_configuration = Arc::new(OnceLock::default());
+        let config = workspace_configuration.clone();
+        let raw_adapter = adapter.adapter.clone();
+        cx.spawn(async move |cx| {
+            let configuration = raw_adapter
+                .workspace_configuration(&*fs, &lsp_delegate, toolchains, cx)
+                .await
+                .unwrap_or(serde_json::Value::Null);
+            config
+                .set(configuration)
+                .expect("This side of the channel to be responsible for initialization");
+        })
+        .detach();
+
         InnerTreeNode {
             id: Default::default(),
             disposition: Arc::new(LaunchDisposition {
-                server_name,
+                server_name: adapter.name(),
                 path,
                 settings: settings.into(),
-                toolchain,
+                workspace_configuration,
             }),
         }
     }
@@ -116,11 +135,13 @@ impl LanguageServerTree {
     pub(crate) fn new(
         manifest_tree: Entity<ManifestTree>,
         languages: Arc<LanguageRegistry>,
+        fs: Arc<dyn Fs>,
     ) -> Self {
         Self {
             manifest_tree,
             instances: Default::default(),
             languages,
+            fs,
         }
     }
 
@@ -146,22 +167,45 @@ impl LanguageServerTree {
         manifest_name: Option<&ManifestName>,
         delegate: &Arc<dyn ManifestDelegate>,
         toolchains: Arc<dyn LocalLanguageToolchainStore>,
+        lsp_delegate: Arc<dyn LspAdapterDelegate>,
         cx: &mut App,
     ) -> impl Iterator<Item = LanguageServerTreeNode> + 'a {
         let manifest_location = self.manifest_location_for_path(&path, manifest_name, delegate, cx);
         let adapters = self.adapters_for_language(&manifest_location, &language_name, cx);
-        self.init_with_adapters(manifest_location, language_name, adapters, toolchains, cx)
+        self.walk_with_adapters(
+            manifest_location,
+            language_name,
+            adapters,
+            toolchains,
+            lsp_delegate,
+            cx,
+        )
     }
 
-    fn init_with_adapters<'a>(
+    fn walk_with_adapters<'a>(
         &'a mut self,
         root_path: ProjectPath,
         language_name: LanguageName,
         adapters: IndexMap<LanguageServerName, (LspSettings, Arc<CachedLspAdapter>)>,
         toolchains: Arc<dyn LocalLanguageToolchainStore>,
+        lsp_delegate: Arc<dyn LspAdapterDelegate>,
         cx: &App,
     ) -> impl Iterator<Item = LanguageServerTreeNode> + 'a {
-        let mut cx = cx.to_async();
+        let mut build_node = {
+            let fs = self.fs.clone();
+            let mut cx = cx.to_async();
+            move |adapter, root_path, settings| {
+                Arc::new(InnerTreeNode::new(
+                    adapter,
+                    root_path,
+                    settings,
+                    fs.clone(),
+                    toolchains.clone(),
+                    lsp_delegate.clone(),
+                    &mut cx,
+                ))
+            }
+        };
         adapters.into_iter().map(move |(_, (settings, adapter))| {
             let root_path = root_path.clone();
             let inner_node = self
@@ -173,24 +217,11 @@ impl LanguageServerTree {
                 .or_default()
                 .entry(adapter.name());
             let (node, languages) = inner_node.or_insert_with(|| {
-                let toolchain = toolchains.clone().active_toolchain(
-                    root_path.worktree_id,
-                    &root_path.path,
-                    language_name.clone(),
-                    &mut cx,
-                );
-                (
-                    Arc::new(InnerTreeNode::new(
-                        adapter.name(),
-                        root_path.clone(),
-                        settings.clone(),
-                        toolchain,
-                    )),
-                    Default::default(),
-                )
+                let node = build_node(adapter, root_path.clone(), settings.clone());
+                (node, Default::default())
             });
             languages.insert(language_name.clone());
-            Arc::downgrade(&node).into()
+            LanguageServerTreeNode::from(Arc::downgrade(&node))
         })
     }
 
@@ -368,8 +399,11 @@ impl ServerTreeRebase {
                 })
             })
             .collect();
-        let new_tree =
-            LanguageServerTree::new(old_tree.manifest_tree.clone(), old_tree.languages.clone());
+        let new_tree = LanguageServerTree::new(
+            old_tree.manifest_tree.clone(),
+            old_tree.languages.clone(),
+            old_tree.fs.clone(),
+        );
         Self {
             old_contents,
             all_server_ids,
@@ -385,6 +419,7 @@ impl ServerTreeRebase {
         manifest_name: Option<&ManifestName>,
         delegate: Arc<dyn ManifestDelegate>,
         toolchain_delegate: Arc<dyn LocalLanguageToolchainStore>,
+        lsp_delegate: Arc<dyn LspAdapterDelegate>,
         cx: &mut App,
     ) -> impl Iterator<Item = LanguageServerTreeNode> + 'a {
         let manifest =
@@ -395,7 +430,14 @@ impl ServerTreeRebase {
             .adapters_for_language(&manifest, &language_name, cx);
 
         self.new_tree
-            .init_with_adapters(manifest, language_name, adapters, toolchain_delegate, cx)
+            .walk_with_adapters(
+                manifest,
+                language_name,
+                adapters,
+                toolchain_delegate,
+                lsp_delegate,
+                cx,
+            )
             .filter_map(|node| {
                 // Inspect result of the query and initialize it ourselves before
                 // handing it off to the caller.
@@ -411,11 +453,13 @@ impl ServerTreeRebase {
                     .and_then(|worktree_nodes| worktree_nodes.roots.get(&disposition.path.path))
                     .and_then(|roots| roots.get(&disposition.server_name))
                     .filter(|(old_node, _)| {
-                        (&disposition.toolchain, &disposition.settings)
-                            == (
-                                &old_node.disposition.toolchain,
-                                &old_node.disposition.settings,
-                            )
+                        (
+                            &disposition.workspace_configuration.wait(),
+                            &disposition.settings,
+                        ) == (
+                            &old_node.disposition.workspace_configuration.wait(),
+                            &old_node.disposition.settings,
+                        )
                     })
                 else {
                     return Some(node);

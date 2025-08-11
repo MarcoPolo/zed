@@ -55,8 +55,8 @@ use language::{
     Bias, BinaryStatus, Buffer, BufferSnapshot, CachedLspAdapter, CodeLabel, Diagnostic,
     DiagnosticEntry, DiagnosticSet, DiagnosticSourceKind, Diff, File as _, Language, LanguageName,
     LanguageRegistry, LocalFile, LocalLanguageToolchainStore, LspAdapter, LspAdapterDelegate,
-    ManifestDelegate, Patch, PointUtf16, TextBufferSnapshot, ToOffset, ToPointUtf16, Toolchain,
-    Transaction, Unclipped, WorkspaceFoldersContent,
+    ManifestDelegate, Patch, PointUtf16, TextBufferSnapshot, ToOffset, ToPointUtf16, Transaction,
+    Unclipped, WorkspaceFoldersContent,
     language_settings::{
         FormatOnSave, Formatter, LanguageSettings, SelectedFormatter, language_settings,
     },
@@ -160,7 +160,7 @@ struct UnifiedLanguageServer {
 struct LanguageServerSeed {
     worktree_id: WorktreeId,
     name: LanguageServerName,
-    toolchain: Option<Toolchain>,
+    workspace_configuration: serde_json::Value,
     settings: Arc<LspSettings>,
 }
 
@@ -244,7 +244,7 @@ impl LocalLspStore {
             worktree_id: worktree_handle.read(cx).id(),
             name: disposition.server_name.clone(),
             settings: disposition.settings.clone(),
-            toolchain: disposition.toolchain.clone(),
+            workspace_configuration: disposition.workspace_configuration.wait().clone(),
         };
         if let Some(state) = self.language_server_ids.get_mut(&key) {
             state.project_roots.insert(disposition.path.path.clone());
@@ -2533,9 +2533,10 @@ impl LocalLspStore {
                         language.manifest(),
                         &delegate,
                         toolchain_store,
+                        lsp_delegate.clone(),
                         cx,
                     )
-                    .collect::<Vec<_>>();
+                    .collect();
                 (false, lsp_delegate, servers)
             });
         let servers_and_adapters = servers
@@ -3884,6 +3885,7 @@ impl LspStore {
                 prettier_store,
                 environment,
                 http_client,
+                lsp_tree: LanguageServerTree::new(manifest_tree, languages.clone(), fs.clone()),
                 fs,
                 yarn,
                 next_diagnostic_group_id: Default::default(),
@@ -3893,7 +3895,7 @@ impl LspStore {
                         .unwrap()
                         .shutdown_language_servers_on_quit(cx)
                 }),
-                lsp_tree: LanguageServerTree::new(manifest_tree, languages.clone()),
+
                 registered_buffers: HashMap::default(),
                 buffers_opened_in_servers: HashMap::default(),
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
@@ -4836,6 +4838,7 @@ impl LspStore {
                 {
                     let delegate =
                         Arc::new(ManifestQueryDelegate::new(worktree.read(cx).snapshot()));
+
                     let path = file
                         .path()
                         .parent()
@@ -4849,6 +4852,7 @@ impl LspStore {
                         language.manifest(),
                         delegate.clone(),
                         toolchain_store.clone(),
+                        lsp_delegate.clone(),
                         cx,
                     );
 
@@ -4863,11 +4867,10 @@ impl LspStore {
                                 worktree_id: worktree.read(cx).id(),
                                 name: disposition.server_name.clone(),
                                 settings: disposition.settings.clone(),
-                                toolchain: local.toolchain_store.read(cx).active_toolchain(
-                                    path.worktree_id,
-                                    &path.path,
-                                    language.name(),
-                                ),
+                                workspace_configuration: disposition
+                                    .workspace_configuration
+                                    .wait()
+                                    .clone(),
                             };
                             local.language_server_ids.remove(&key);
 
